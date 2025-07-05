@@ -11,21 +11,26 @@ async fn send_media_key(_key: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
+        use std::os::windows::process::CommandExt;
         
-        // Use PowerShell to send media key
+        // Use PowerShell with hidden window style to prevent foreground appearance
         let result = Command::new("powershell")
             .arg("-WindowStyle")
             .arg("Hidden")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
             .arg("-Command")
             .arg(format!(
-                "$code = [System.Windows.Forms.Keys]::MediaPlayPause; \
-                 Add-Type -AssemblyName System.Windows.Forms; \
+                "Add-Type -AssemblyName System.Windows.Forms; \
                  $signature = '[DllImport(\"user32.dll\")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, uint dwExtraInfo);'; \
                  $SendInput = Add-Type -MemberDefinition $signature -Name \"Win32SendInput\" -Namespace Win32Functions -PassThru; \
                  $SendInput::keybd_event(0xB3, 0, 0, 0); \
                  Start-Sleep -Milliseconds 50; \
                  $SendInput::keybd_event(0xB3, 0, 2, 0);"
             ))
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW flag
             .output();
             
         match result {
