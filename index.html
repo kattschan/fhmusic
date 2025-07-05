@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body {
+      font-family: 'Inter', sans-serif;
+    }
+  </style>
+</head>
+<body class="bg-gray-900 text-white">
+
+  <div class="container mx-auto p-4 md:p-8">
+    <div class="max-w-4xl mx-auto">
+      <header class="text-center mb-8">
+        <h1 class="text-4xl font-bold text-cyan-400">FH Music Controller</h1>
+        <p class="text-gray-400 mt-2">Running in background - Configuration Panel</p>
+      </header>
+
+      <main>
+        <div class="bg-gray-800 rounded-lg shadow-lg p-6 mb-6">
+          <h2 class="text-2xl font-semibold mb-4 text-cyan-300">Status</h2>
+          <div class="grid grid-cols-2 gap-4 mb-4">
+            <div class="bg-gray-700 p-4 rounded">
+              <h3 class="text-sm font-medium text-gray-400 mb-1">Listener Status</h3>
+              <p id="listener-status" class="text-lg font-semibold text-red-400">Stopped</p>
+            </div>
+            <div class="bg-gray-700 p-4 rounded">
+              <h3 class="text-sm font-medium text-gray-400 mb-1">UDP Port</h3>
+              <p class="text-lg font-semibold text-cyan-400">3200</p>
+            </div>
+          </div>
+          <div class="flex gap-4">
+            <button id="start-button" class="flex-1 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded transition duration-300">
+              Start Listening
+            </button>
+            <button id="stop-button" class="flex-1 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded transition duration-300" disabled>
+              Stop Listening
+            </button>
+            <button id="minimize-button" class="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded transition duration-300">
+              Minimize to Tray
+            </button>
+          </div>
+        </div>
+
+        <div class="bg-gray-800 rounded-lg shadow-lg p-6">
+          <h2 class="text-2xl font-semibold mb-4 text-cyan-300">Activity Log</h2>
+          <div id="log-display" class="bg-gray-900 rounded-md p-4 h-48 overflow-y-auto border border-gray-700">
+            <p class="text-gray-500">Log entries will appear here...</p>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bind, unbind } from "@kuyoonjo/tauri-plugin-udp";
+    import { listen } from "@tauri-apps/api/event";
+    import { writeTextFile, readTextFile, mkdir, exists } from "@tauri-apps/plugin-fs";
+    import { appLogDir, join } from "@tauri-apps/api/path";
+    import { BaseDirectory } from "@tauri-apps/plugin-fs";
+    import { invoke } from "@tauri-apps/api/core";
+    import { getCurrentWindow } from "@tauri-apps/api/window";
+
+    const logDisplay = document.getElementById('log-display');
+    const startButton = document.getElementById('start-button');
+    const stopButton = document.getElementById('stop-button');
+    const minimizeButton = document.getElementById('minimize-button');
+    const listenerStatus = document.getElementById('listener-status');
+
+    const socketId = "main-udp-socket";
+    const port = 3200;
+    const address = `0.0.0.0:${port}`;
+    let lastFirstByte = null; // Track the first byte of the last received packet
+    let isListening = false;
+    
+    // Performance tracking variables
+    let packetsPerSecond = {};
+    let currentSecond = 0;
+    let performanceStartTime = 0;
+
+    // Function to add messages to the UI
+    function addMessageToDisplay(display, message, isError = false) {
+      // Only clear the display if it contains the initial placeholder text
+      if (display.innerHTML.includes("Waiting for") || display.innerHTML.includes("Log entries will appear")) {
+        display.innerHTML = '';
+      }
+      
+      const p = document.createElement('p');
+      p.textContent = message;
+      if (isError) {
+        p.className = 'text-red-400';
+      } else {
+        p.className = 'text-gray-300';
+      }
+      display.appendChild(p);
+      display.scrollTop = display.scrollHeight;
+    }
+
+    // Function to control system media playback
+    async function controlMediaPlayback(shouldPlay) {
+      try {
+        if (shouldPlay) {
+          await invoke('send_media_key', { key: 'MediaPlayPause' });
+          console.log('Sent media play command');
+        } else {
+          await invoke('send_media_key', { key: 'MediaPlayPause' });
+          console.log('Sent media pause command');
+        }
+      } catch (error) {
+        console.error('Failed to control media playback:', error);
+        addMessageToDisplay(logDisplay, `Media control error: ${error}`, true);
+      }
+    }
+    async function logToFile(message) {
+      try {
+        const timestamp = new Date().toISOString();
+        const logEntry = `${timestamp} - ${message}\n`;
+        
+        // Use append mode instead of reading entire file and rewriting
+        await writeTextFile("udp_log.txt", logEntry, { 
+          baseDir: BaseDirectory.AppLog,
+          append: true 
+        });
+        
+        // Append to the log display instead of replacing
+        addMessageToDisplay(logDisplay, logEntry.trim());
+      } catch (error) {
+        const errorMessage = `Failed to write to log file: ${error}`;
+        console.error(errorMessage);
+        addMessageToDisplay(logDisplay, errorMessage, true);
+      }
+    }
+
+    // Main function to start the UDP listener
+    async function startUdpListener() {
+        if (isListening) return;
+        
+        startButton.disabled = true;
+        startButton.textContent = 'Starting...';
+
+        try {
+            // 1. Set up log file path - simplified since we're using BaseDirectory
+            addMessageToDisplay(logDisplay, `Logging to: AppLog/udp_log.txt`);
+            
+            // Initialize performance tracking
+            performanceStartTime = Date.now();
+
+            // 2. Bind to the UDP socket
+            await bind(socketId, address);
+            const successMessage = `Successfully bound to UDP socket on port ${port}`;
+            console.log(successMessage);
+            await logToFile("Listener started successfully.");
+            
+            isListening = true;
+            listenerStatus.textContent = 'Running';
+            listenerStatus.className = 'text-lg font-semibold text-green-400';
+            startButton.textContent = 'Start Listening';
+            startButton.disabled = true;
+            stopButton.disabled = false;
+
+            // 3. Listen for incoming UDP packets
+            await listen("plugin://udp", async (event) => {
+            if (event.payload.id === socketId) {
+                const dataArray = new Uint8Array(event.payload.data);
+                const firstByte = dataArray[0];
+                
+                // Track packets per second for performance monitoring
+                const now = Date.now();
+                const secondsSinceStart = Math.floor((now - performanceStartTime) / 1000);
+                
+                if (!packetsPerSecond[secondsSinceStart]) {
+                    packetsPerSecond[secondsSinceStart] = 0;
+                }
+                packetsPerSecond[secondsSinceStart]++;
+                
+                // Report performance every 10 seconds
+                if (secondsSinceStart > 0 && secondsSinceStart % 10 === 0 && secondsSinceStart !== currentSecond) {
+                    currentSecond = secondsSinceStart;
+                    const startSecond = secondsSinceStart - 9;
+                    let secondsWithGoodPerformance = 0;
+                    
+                    for (let i = startSecond; i < secondsSinceStart; i++) {
+                        if (packetsPerSecond[i] >= 60) {
+                            secondsWithGoodPerformance++;
+                        }
+                    }
+                    
+                    const performanceMessage = `Performance: ${secondsWithGoodPerformance}/10 seconds had 60+ updates`;
+                    console.log(performanceMessage);
+                    await logToFile(performanceMessage);
+                }
+                
+                // Only log if the first byte has changed
+                if (firstByte !== lastFirstByte) {
+                    const previousByte = lastFirstByte;
+                    lastFirstByte = firstByte;
+                    const message = `First byte changed to: ${firstByte} (0x${firstByte.toString(16).padStart(2, '0')}) from ${event.payload.addr}`;
+                    
+                    // Control media based on byte value
+                    if (firstByte === 1 && previousByte !== 1) {
+                        // Game is active - resume media
+                        await controlMediaPlayback(true);
+                        logToFile(`${message} - Media RESUMED`);
+                    } else if (firstByte === 0 && previousByte !== 0) {
+                        // Game is paused/cutscene - pause media
+                        await controlMediaPlayback(false);
+                        logToFile(`${message} - Media PAUSED`);
+                    } else {
+                        // Other byte values - just log without media control
+                        logToFile(message);
+                    }
+                }
+            }
+            });
+
+        } catch (error) {
+            const errorMessage = `Failed to bind UDP socket: ${error}`;
+            console.error(errorMessage);
+            addMessageToDisplay(logDisplay, errorMessage, true);
+            await logToFile(errorMessage);
+            startButton.disabled = false;
+            startButton.textContent = 'Start Listening';
+            listenerStatus.textContent = 'Error';
+            listenerStatus.className = 'text-lg font-semibold text-red-400';
+        }
+    }
+
+    // Function to stop the UDP listener
+    async function stopUdpListener() {
+        if (!isListening) return;
+        
+        try {
+            await unbind(socketId);
+            isListening = false;
+            listenerStatus.textContent = 'Stopped';
+            listenerStatus.className = 'text-lg font-semibold text-red-400';
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            addMessageToDisplay(logDisplay, 'UDP listener stopped');
+            await logToFile("Listener stopped");
+        } catch (error) {
+            console.error('Failed to stop UDP listener:', error);
+            addMessageToDisplay(logDisplay, `Failed to stop listener: ${error}`, true);
+        }
+    }
+    
+    // Event listeners
+    startButton.addEventListener('click', startUdpListener);
+    stopButton.addEventListener('click', stopUdpListener);
+    minimizeButton.addEventListener('click', async () => {
+        const currentWindow = getCurrentWindow();
+        await currentWindow.hide();
+    });
+
+    // Auto-start listener when app loads
+    document.addEventListener('DOMContentLoaded', () => {
+        setTimeout(startUdpListener, 1000); // Start after 1 second
+    });
+
+  </script>
+</body>
+</html>
